@@ -1,0 +1,117 @@
+name: Deployment
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git-deployment-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        env:
+          DEPLOY_GIT_URL: ${{ secrets.DEPLOY_GIT_URL }}
+          DEPLOY_GIT_BRANCH: ${{ secrets.DEPLOY_GIT_BRANCH }}
+          DEPLOY_GIT_USER: ${{ secrets.DEPLOY_GIT_USER }}
+          DEPLOY_GIT_TOKEN: ${{ secrets.DEPLOY_GIT_TOKEN }}
+          DEPLOY_GPG_PRIVATE_KEY: ${{ secrets.DEPLOY_GPG_PRIVATE_KEY }}
+        run: |
+          for secret in DEPLOY_GIT_URL DEPLOY_GIT_BRANCH DEPLOY_GIT_USER DEPLOY_GIT_TOKEN DEPLOY_GPG_PRIVATE_KEY; do
+            if [[ -z "${!secret}" ]]; then
+              echo "::error::Missing required repository secret $secret"
+              exit 1
+            fi
+          done
+
+          if [[ "$DEPLOY_GIT_URL" != https://* ]]; then
+            echo "::error::DEPLOY_GIT_URL must be an HTTPS Git URL."
+            exit 1
+          fi
+          git check-ref-format "refs/heads/$DEPLOY_GIT_BRANCH"
+
+      - name: Sign Deployment Commit
+        env:
+          DEPLOY_GIT_USER: ${{ secrets.DEPLOY_GIT_USER }}
+          DEPLOY_GPG_PRIVATE_KEY: ${{ secrets.DEPLOY_GPG_PRIVATE_KEY }}
+          DEPLOY_GPG_KEY_ID: ${{ secrets.DEPLOY_GPG_KEY_ID }}
+        run: |
+          umask 077
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d "$RUNNER_TEMP/deploy-gnupg.XXXXXX")"
+          trap 'gpgconf --kill gpg-agent; rm -rf "$GNUPGHOME"' EXIT
+
+          case "$DEPLOY_GPG_PRIVATE_KEY" in
+            *'-----BEGIN PGP PRIVATE KEY BLOCK-----'*)
+              printf '%s\n' "$DEPLOY_GPG_PRIVATE_KEY" | gpg --batch --import
+              ;;
+            *)
+              printf '%s' "$DEPLOY_GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import
+              ;;
+          esac
+
+          signing_key="$DEPLOY_GPG_KEY_ID"
+          if [[ -z "$signing_key" ]]; then
+            signing_key="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "sec" {print $5; exit}')"
+          fi
+          if [[ -z "$signing_key" ]]; then
+            echo "::error::The imported GPG key contains no private signing key."
+            exit 1
+          fi
+
+          git config --local user.name "$DEPLOY_GIT_USER"
+          git config --local user.email "${DEPLOY_GIT_USER}@users.noreply.github.com"
+          git config --local gpg.format openpgp
+          git config --local gpg.program gpg
+
+          source_commit="$(git rev-parse HEAD)"
+          # Orphan checkout carries main's tracked files into a new root commit.
+          git checkout --orphan deployment-snapshot main
+          # GPG resolves key IDs and selects an available signing subkey.
+          git commit --allow-empty --gpg-sign="$signing_key" -m "Deploy $GITHUB_REPOSITORY@$source_commit"
+          git verify-commit HEAD
+
+      - name: Push Deployment Commit
+        env:
+          DEPLOY_GIT_URL: ${{ secrets.DEPLOY_GIT_URL }}
+          DEPLOY_GIT_BRANCH: ${{ secrets.DEPLOY_GIT_BRANCH }}
+          DEPLOY_GIT_USERNAME: ${{ secrets.DEPLOY_GIT_USER }}
+          DEPLOY_GIT_TOKEN: ${{ secrets.DEPLOY_GIT_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          # Askpass reads credentials from the environment during authentication.
+          export GIT_ASKPASS="$RUNNER_TEMP/deploy-git-askpass.sh"
+          trap 'rm -f "$GIT_ASKPASS"' EXIT
+          umask 077
+          cat > "$GIT_ASKPASS" <<'ASKPASS'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*) printf '%s\n' "$DEPLOY_GIT_USERNAME" ;;
+            *Password*) printf '%s\n' "$DEPLOY_GIT_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$GIT_ASKPASS"
+
+          git remote set-url origin "$DEPLOY_GIT_URL"
+          # An explicit destination ref creates the branch when it is missing.
+          git -c credential.helper= -c push.followTags=false push --force origin "HEAD:refs/heads/$DEPLOY_GIT_BRANCH"
